@@ -12,7 +12,9 @@ app.get("/", (req, res)=>{
     res.render("index")
 })
 
-
+app.get("/bollywoodnews", (req, res)=>{
+    res.render("bollywoodnews")
+})
 
 
 
