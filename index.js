@@ -1,6 +1,7 @@
 const express = require('express')
 const app = express()
 const dotenv = require('dotenv')
+const fetch = require('cross-fetch')
 dotenv.config()
 const PORT = process.env.PORT || 3000
 
@@ -16,15 +17,11 @@ app.get("/bollywoodnews", (req, res)=>{
     res.render("bollywoodnews")
 })
 
-app.post("/login", async (req, res)=>{
-    let email1 = req.body.email1
-    let password1 = req.body.password1
-
-
-
-
+app.get("/bollywoodnewsjson", (req, res)=>{
+    fetch("https://newsapi.org/v2/top-headlines?country=in&category=entertainment&apiKey="+process.env.apikey).then((resp)=>{
+            return resp.json()
+        }).then((fres)=>{res.json(fres)})
 })
-
 
 
 app.listen(PORT, (err)=>{
