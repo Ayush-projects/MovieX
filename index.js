@@ -16,6 +16,14 @@ app.get("/bollywoodnews", (req, res)=>{
     res.render("bollywoodnews")
 })
 
+app.post("/login", async (req, res)=>{
+    let email1 = req.body.email1
+    let password1 = req.body.password1
+
+
+
+
+})
 
 
 
