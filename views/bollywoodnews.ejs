@@ -1,0 +1,55 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.1/dist/css/bootstrap.min.css" rel="stylesheet" integrity="sha384-4bw+/aepP/YC94hEpVNVgiZdgIC5+VKNBQNGCHeKRQN+PtmoHDEXuppvnDJzQIu9" crossorigin="anonymous">
+    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.1/dist/js/bootstrap.bundle.min.js" integrity="sha384-HwwvtgBNo3bZJJLYd8oVXjrBZt8cqVSpeBNS5n7C8IVInixGAoxmnlMuBnhbgrkm" crossorigin="anonymous"></script>
+    <title>Bollywood News</title>
+</head>
+<body>
+    <%- include("./components/header") %> <br><br>
+    <div class="container">
+       <div class="text-center"> <h1><b>BOLLYWOOD NEWS</b></h1></div>
+        <div class="row mb-2" id="news">
+
+        </div>
+    </div>
+
+    <script>
+        fetch("https://newsapi.org/v2/top-headlines?country=in&category=entertainment&apiKey=d846c4a3c65b4e2ebade73f6bdbb6002").then((res)=>{
+            return res.json()
+        }).then((fres)=>{
+            
+            
+            let news = fres.articles
+            for(let i=0; i<news.length; i++)
+            {
+                document.getElementById("news").innerHTML += `
+                
+                
+        <div class="col-md-6">
+          <div class="card flex-md-row mb-4 box-shadow h-md-250">
+            <div class="card-body d-flex flex-column align-items-start">
+              <strong class="d-inline-block mb-2 text-primary">CINEMA</strong>
+              <h3 class="mb-0">
+                <a class="text-dark" href="${news[i].url}">${news[i].title}</a>
+              </h3>
+              <div class="mb-1 text-muted">Nov 12</div>
+              <p class="card-text mb-auto">${news[i].description}</p>
+              <a href="${news[i].url}">Continue reading</a>
+            </div>
+            <img class="card-img-right flex-auto d-none d-md-block" data-src="holder.js/200x250?theme=thumb" alt="Thumbnail [200x250]" src="${news[i].urlToImage}" data-holder-rendered="true" style="width: 200px; height: 250px;">
+            
+          </div>
+        </div>
+
+
+
+                `
+            }
+        })
+    </script>
+      <%-include("./components/footer.ejs")%>  
+</body>
+</html>
