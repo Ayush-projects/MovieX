@@ -1,0 +1,723 @@
+import { BaseDBManager } from "../../../managers/basemanager/basemanager";
+import { Node } from "../../../entities/nms-entities/Node.entity";
+import { Ipinterface } from '../../../entities/nms-entities/Ipinterface.entity'; // Ensure this entity exists and is correctly defined
+import { DataSource, Repository } from "typeorm";
+import { InjectRepository } from "@nestjs/typeorm";
+import { INodeManager } from "./node-manager.interface";
+import { INodeFilter } from "../filter/node-filter.interface";
+import {
+  BadRequestException,
+  Body,
+  Inject,
+  NotAcceptableException,
+  OnApplicationBootstrap,
+} from "@nestjs/common";
+import { INodeMapper } from "../mapper/node-mapper.interface";
+import { IOpenNMSWrapper } from "../../../opennms-wrapper/opennms-wrapper.interface";
+import {
+  PAYLOAD_TYPE,
+  REQUEST_TYPES,
+} from "../../../opennms-wrapper/opennms-api.constants";
+import { EventEmitter2 } from "@nestjs/event-emitter";
+import { NodeCreateDto } from "../dto/create-node-dto";
+import { errorHandler } from "../../../constants/global.error";
+import {
+  opennmsNodeURL,
+  requsitionURL,
+} from "../../../constants/global.constants";
+import { GeoLocation } from "../../../entities/nms-entities/geolocation.entity";
+import { NodeStatusCronJob } from "./nodeStatus-cronjob-manager";
+import { NodeDataSourceType } from "../constants/nodedatasourcetype";
+
+import { NodeUtilsServices } from "../utils/node-utils-services";
+import {
+  AllGeoNodesResponseDto,
+  NodeGeoDto,
+} from "../dto/ReadNodeAllWithGeo.dto";
+import { DeleteNodesDto } from "../dto/delete-nodes-dto";
+import { NODE_DELETE, SOME_NODE_NOT_DELETE } from "../constants/node.constants";
+import { ChartFilterOptions } from "src/modules/filters/dto/filter-options";
+
+import { xml2js } from "xml2js";
+import { AgentNodeCreateDto } from "../dto/create-node-agent-dto.";
+import { NodeDetailsEntity } from "../entities/nodedetails.entity";
+import { ValidateInstallationDto } from "../dto/validateInstallation-dto";
+import { NODE_EVENT_CONSTANTS } from "../constants/node-event-constant";
+import { AgentInstallationStatus } from "../constants/nodeAgent.constant";
+import { AgentNodeUpdateDto } from "../dto/update-node-agent-dto";
+
+import { ApiResponse } from "@nestjs/swagger";
+import { NodeUpdateDto } from "../dto/update-node-dto";
+import { NodeSnmpConfigDto } from "../dto/UpdateSNMP-node-dto";
+import { NodeData } from "../dto/NodeData-dto";
+import { SNMP_MESSAGE_HANDLER } from "../constants/snmp.constant";
+export class NodeManager
+  extends BaseDBManager<Node>
+  implements INodeManager, OnApplicationBootstrap
+{
+  constructor(
+    @InjectRepository(Node) repository: Repository<Node>,
+    @Inject(INodeFilter) filters: INodeFilter,
+    @Inject(INodeMapper) mapper: INodeMapper,
+    @Inject(IOpenNMSWrapper) private openNMSManager: IOpenNMSWrapper,
+    @Inject(EventEmitter2) private event: EventEmitter2,
+    @InjectRepository(GeoLocation)
+    private readonly geolocationRepository: Repository<GeoLocation>,
+    @Inject(NodeStatusCronJob) private nodeStatusCronManager: NodeStatusCronJob,
+    private dataSource: DataSource,
+    @Inject(NodeUtilsServices)
+    private nodeUtilsServicesManager: NodeUtilsServices,
+    @InjectRepository(NodeDetailsEntity)
+    private nodeDetailsRepository: Repository<NodeDetailsEntity>,
+    @InjectRepository(Ipinterface)  // Ensure this is added
+    private ipInterfaceRepository: Repository<Ipinterface>
+  ) {
+    super(repository, filters, mapper);
+  }
+  getNodeSnmpConfig(ipAddress: any) {
+    throw new Error("Method not implemented.");
+  }
+  UpdateSnmpConfig(ipAddress: string) {
+    throw new Error("Method not implemented.");
+  }
+  async onApplicationBootstrap() {
+    await this.nodeStatusCronManager.nodeStatusCronJob();
+  }
+
+  private readonly endpoint = "requisitions/";
+  private readonly entityName = "Node";
+
+  async delete(id: string | number, data: any): Promise<void> {
+    let updatedEndpoint = `/requisitions/${data.requisition}/nodes/${id}`;
+    try {
+      const response = await this.openNMSManager.makeRequest(updatedEndpoint, {
+        request: REQUEST_TYPES.DELETE,
+      });
+      this.event.emit(`${this.entityName}-deleted`, {
+        id,
+        isDeleted: true,
+        user: data["user"],
+      });
+      return response;
+    } catch (error) {
+      console.log(error);
+    }
+  }
+
+  private getEndpoint(data: string) {
+    let requisition_name = encodeURIComponent(data);
+    const newEndpoint = this.endpoint + requisition_name + "/" + "nodes";
+    return newEndpoint;
+  }
+
+  async DeleteById(nodesData: DeleteNodesDto, user: {}): Promise<any> {
+    let nodeErrors = [];
+    await Promise.all(
+      nodesData.nodes.map(async (item) => {
+        const nodeId = item.nodeId;
+        try {
+          const nodeData = await this.repository.findOneBy({ nodeid: nodeId });
+
+          await this.openNMSManager.makeRequest(
+            `/requisitions/${item.requisitionName}/nodes/${nodeData.foreignid}`,
+            {
+              request: REQUEST_TYPES.DELETE,
+            }
+          );
+
+          await this.openNMSManager.makeRequest("/nodes/" + nodeId, {
+            request: REQUEST_TYPES.DELETE,
+          });
+
+          this.event.emit(`${this.entityName}-deleted`, {
+            nodeId,
+            user,
+            isDeleted: true,
+          });
+        } catch (error) {
+          const nodeError = { nodeId: item.nodeId, error: error };
+          nodeErrors.push(nodeError);
+        }
+      })
+    );
+    if (nodeErrors.length > 0) {
+      throw new BadRequestException({
+        message: SOME_NODE_NOT_DELETE + " " + nodeErrors,
+      });
+    }
+    return { message: NODE_DELETE, ...nodesData };
+  }
+
+  async getResource(nodeId: string): Promise<any> {
+    const endpoint = opennmsNodeURL.nodeResource + nodeId;
+
+    const response = await this.openNMSManager.makeRequest(endpoint, {
+      request: REQUEST_TYPES.GET,
+    });
+
+    return response;
+  }
+
+  async getGraph(graphId: string): Promise<any> {
+    const endpoint = opennmsNodeURL.nodeGraph + graphId;
+
+    const response = await this.openNMSManager.makeRequest(endpoint, {
+      request: REQUEST_TYPES.GET,
+    });
+
+    return response;
+  }
+
+  async getResourceData(bodyData): Promise<any> {
+    const endpoint = opennmsNodeURL.nodeMeasurements;
+
+    const response = await this.openNMSManager.makeRequest(endpoint, {
+      request: REQUEST_TYPES.POST,
+      body: bodyData,
+    });
+
+    return response;
+  }
+
+  async getTimelineData(nodeid: number, startdate: Date, enddate: Date) {
+    const timelineData = await this.repository.query(
+      `SELECT * FROM service_outage_per_interface($1, $2, $3)`,
+      [`${startdate.toISOString()}`, `${enddate.toISOString()}`, `${nodeid}`]
+    );
+    return timelineData;
+  }
+
+  async createNodeSnmp(dto: {} | NodeCreateDto) {
+    dto["foreign-id"] = await this.nodeUtilsServicesManager.getForeignId();
+
+    // validation start
+
+    await this.nodeUtilsServicesManager.validateNodePayload(dto);
+
+    if (dto["category"]?.length > 0) {
+      // validating if categories exists
+      await this.nodeUtilsServicesManager.nodeCatogriesValid(dto["category"]);
+    }
+
+    // validation ends
+
+    const newEndpoint = this.getEndpoint(dto["requisition-name"]);
+    const requisitionName = dto["requisition-name"];
+    const geoLocation = dto["geolocation"];
+    delete dto["geolocation"];
+    delete dto["requisition-name"];
+    let user = dto["user"];
+    delete dto["user"];
+    const snmpParamsData = dto["snmp-params"];
+    delete dto["snmp-params"];
+
+    const nodeJson = JSON.stringify(dto);
+
+    let snmpConfigData;
+    if (snmpParamsData.snmp) {
+      snmpConfigData =
+        this.nodeUtilsServicesManager.snmpConfigDataConversion(snmpParamsData);
+    }
+
+    const ipAddress =
+      await this.nodeUtilsServicesManager.extarctIpFromInterfaces(
+        dto["interface"]
+      );
+
+    try {
+      await this.openNMSManager.makeRequest(newEndpoint, {
+        request: REQUEST_TYPES.POST,
+        body: nodeJson,
+      });
+      if (snmpParamsData.snmp) {
+        await this.openNMSManager.makeRequest(
+          `/snmpConfig/${ipAddress}`,
+          {
+            request: REQUEST_TYPES.PUT,
+            body: snmpConfigData,
+          },
+          PAYLOAD_TYPE.XML
+        );
+      }
+      await this.openNMSManager.makeRequest(
+        `/requisitions/${requisitionName}/import`,
+        {
+          request: REQUEST_TYPES.PUT,
+          body: { rescanExisting: false },
+        }
+      );
+    } catch (error) {
+      throw new BadRequestException({ message: error.response.data });
+    }
+
+    dto["node_details"] = {
+      dataSourceType: snmpParamsData.snmp
+        ? NodeDataSourceType.SNMP
+        : NodeDataSourceType.NoDataSource,
+    };
+    console.log(dto["node_details"]);
+    dto["snmp-params"] = snmpParamsData;
+    dto["requisition-name"] = requisitionName;
+    dto["geolocation"] = geoLocation;
+    dto["user"] = user;
+    const nodeObject = JSON.stringify(dto);
+    this.event.emit(`${this.entityName}-created`, nodeObject);
+    this.event.emit(NODE_EVENT_CONSTANTS.NODE_INITIALIZED, nodeObject);
+    return dto;
+  }
+
+  async updateNodeSnmp(dto: {} | NodeUpdateDto) {
+    // validation start
+
+    await this.nodeUtilsServicesManager.validateNodePayload(dto, true);
+
+    if (dto["category"]?.length > 0) {
+      // validating if categories exists
+      await this.nodeUtilsServicesManager.nodeCatogriesValid(dto["category"]);
+    }
+
+    // validation ends
+
+    const newEndpoint = this.getEndpoint(dto["requisition-name"]);
+    const requisitionName = dto["requisition-name"];
+    delete dto["requisition-name"];
+    let user = dto["user"];
+    delete dto["user"];
+    const snmpParamsData = dto["snmp-params"];
+    delete dto["snmp-params"];
+    const geoLocation = dto["geolocation"];
+    delete dto["geolocation"];
+
+    let ipAddress;
+    if (dto["interface"] && dto["interface"].length > 0) {
+      ipAddress = await this.nodeUtilsServicesManager.extarctIpFromInterfaces(
+        dto["interface"]
+      );
+    }
+
+    const nodeJson = JSON.stringify(dto);
+
+    let snmpConfigData;
+    if (snmpParamsData.snmp) {
+      snmpConfigData =
+        this.nodeUtilsServicesManager.snmpConfigDataConversion(snmpParamsData);
+    }
+
+    try {
+      await this.openNMSManager.makeRequest(newEndpoint, {
+        request: REQUEST_TYPES.POST,
+        body: nodeJson,
+      });
+      if (snmpParamsData.snmp) {
+        await this.openNMSManager.makeRequest(
+          `/snmpConfig/${ipAddress}`,
+          {
+            request: REQUEST_TYPES.PUT,
+            body: snmpConfigData,
+          },
+          PAYLOAD_TYPE.XML
+        );
+      }
+      await this.openNMSManager.makeRequest(
+        `/requisitions/${requisitionName}/import`,
+        {
+          request: REQUEST_TYPES.PUT,
+          body: { rescanExisting: false },
+        }
+      );
+    } catch (error) {
+      throw new BadRequestException({ message: error.response.data });
+    }
+
+    const nodeData = await this.repository.findOneBy({
+      foreignid: dto["foreign-id"],
+    });
+
+    dto["geolocation"] = geoLocation;
+
+    await this.nodeUtilsServicesManager.createGeolocation(
+      dto["node-label"],
+      dto["foreign-id"],
+      dto["requisition-name"],
+      dto["geolocation"]
+    );
+
+    if (dto["category"]?.length > 0) {
+      // removing the categories for a node
+      await this.nodeUtilsServicesManager.removeNodeCategory(nodeData.nodeid);
+
+      // ading the categories for a node
+      await this.nodeUtilsServicesManager.addNodeCategory(
+        dto["category"],
+        nodeData.nodeid
+      );
+    }
+
+    dto["snmp-params"] = snmpParamsData;
+    dto["requisition-name"] = requisitionName;
+
+    dto["user"] = user;
+    const nodeObject = JSON.stringify(dto);
+    this.event.emit(`${this.entityName}-updated`, nodeObject);
+    return dto;
+  }
+
+  async getNodeSnmpConfigData(ipAddress: string): Promise<any> {
+    try {
+      const response = await this.openNMSManager.makeRequest(
+        `snmpConfig/${ipAddress}`,
+        { request: REQUEST_TYPES.GET }
+      );
+
+      return response;
+    } catch (error) {
+      throw new BadRequestException({ message: error.response.data });
+    }
+  }
+
+  async updateNodeSnmpConfig(payload: NodeSnmpConfigDto) {
+    if (
+      payload.nodeData.nodeLabel !== null &&
+      payload.nodeData.startIp === null &&
+      payload.nodeData.endIp === null
+    ) {
+      // Fetch node data and primary interface
+      const ipAddress =
+        await this.nodeUtilsServicesManager.getPrimaryIpForNodeLabel(
+          payload.nodeData.nodeLabel
+        );
+
+      try {
+        await this.openNMSManager.makeRequest(
+          `/snmpConfig/${ipAddress}`,
+          {
+            request: REQUEST_TYPES.PUT,
+            body: { "snmp-info": payload.snmpInfo },
+          },
+          PAYLOAD_TYPE.XML
+        );
+      } catch (error) {
+        throw new BadRequestException({ message: error.response.data });
+      }
+      return SNMP_MESSAGE_HANDLER.SNMP_UPDATED_SINGLE;
+    }
+
+    if (payload.nodeData.nodeLabel === null) {
+      const allIp = this.nodeUtilsServicesManager.validateAndGetIpsForRange(
+        payload.nodeData.startIp,
+        payload.nodeData.endIp
+      );
+
+      allIp.map(async (ipAddress) => {
+        try {
+          await this.openNMSManager.makeRequest(
+            `/snmpConfig/${ipAddress}`,
+            {
+              request: REQUEST_TYPES.PUT,
+              body: { "snmp-info": payload.snmpInfo },
+            },
+            PAYLOAD_TYPE.XML
+          );
+        } catch (error) {
+          throw new BadRequestException({ message: error.response.data });
+        }
+      });
+
+      return SNMP_MESSAGE_HANDLER.SNMP_UPDATED_BULK;
+    }
+  }
+
+  async getAllNodesWithGeoData(): Promise<AllGeoNodesResponseDto> {
+    const nodes = await this.repository
+      .createQueryBuilder("node")
+      .leftJoinAndSelect("node.geolocation", "geolocation")
+      .leftJoinAndSelect("node.ipinterfaces", "ipinterfaces")
+      .leftJoinAndSelect("ipinterfaces.snmpinterface", "snmpinterface")
+      .leftJoinAndSelect(
+        "node.alarms",
+        "alarms",
+        "alarms.firsteventtime = (SELECT MAX(firsteventtime) FROM alarms WHERE nodeid = node.nodeid)"
+      )
+      .select([
+        "node.nodeid",
+        "node.nodelabel",
+        "node.foreignsource",
+        "geolocation.latitude",
+        "geolocation.longitude",
+        "ipinterfaces.ipaddr",
+        "ipinterfaces.iphostname",
+        "ipinterfaces.ismanaged",
+        "ipinterfaces.snmpinterface",
+        "ipinterfaces.issnmpprimary",
+        "snmpinterface.id",
+        "snmpinterface.nodeid",
+        "snmpinterface.snmpphysaddr",
+        "snmpinterface.snmpifindex",
+        "snmpinterface.snmpifdescr",
+        "snmpinterface.snmpiftype",
+        "snmpinterface.snmpifname",
+        "snmpinterface.snmpifspeed",
+        "snmpinterface.snmpifadminstatus",
+        "snmpinterface.snmpifoperstatus",
+        "snmpinterface.snmpifalias",
+        "snmpinterface.snmpcollect",
+        "snmpinterface.snmplastcapsdpoll",
+        "snmpinterface.snmppoll",
+        "snmpinterface.snmplastsnmppoll",
+        "snmpinterface.lastIngressFlow",
+        "snmpinterface.lastEgressFlow",
+        "alarms.alarmid",
+        "alarms.severity",
+        "alarms.logmsg",
+        "alarms.firsteventtime",
+      ])
+      .getMany();
+
+    const mappedNodes: NodeGeoDto[] = nodes.map((node) =>
+      this.mapNodeToDto(node)
+    );
+    return {
+      count: mappedNodes.length,
+      data: mappedNodes,
+    };
+  }
+
+  private mapNodeToDto(node: Node): NodeGeoDto {
+    const alarms =
+      node.alarms && node.alarms.length > 0 ? node.alarms[0] : null;
+
+    return {
+      nodeid: node.nodeid,
+      nodelabel: node.nodelabel,
+      foreignsource: node.foreignsource,
+      geolocation: node.geolocation
+        ? {
+            latitude: node.geolocation.latitude,
+            longitude: node.geolocation.longitude,
+          }
+        : null,
+      ipinterfaces: node.ipinterfaces.map((ip) => ({
+        ipaddr: ip.ipaddr,
+        iphostname: ip.iphostname,
+        ismanaged: ip.ismanaged,
+        snmpinterface: ip.snmpinterface
+          ? {
+              id: ip.snmpinterface.id,
+              nodeid: ip.snmpinterface.nodeid,
+              snmpphysaddr: ip.snmpinterface.snmpphysaddr,
+              snmpifindex: ip.snmpinterface.snmpifindex,
+              snmpifdescr: ip.snmpinterface.snmpifdescr,
+              snmpiftype: ip.snmpinterface.snmpiftype,
+              snmpifname: ip.snmpinterface.snmpifname,
+              snmpifspeed: ip.snmpinterface.snmpifspeed,
+              snmpifadminstatus: ip.snmpinterface.snmpifadminstatus,
+              snmpifoperstatus: ip.snmpinterface.snmpifoperstatus,
+              snmpifalias: ip.snmpinterface.snmpifalias,
+              snmpcollect: ip.snmpinterface.snmpcollect,
+              snmplastcapsdpoll: ip.snmpinterface.snmplastcapsdpoll,
+              snmppoll: ip.snmpinterface.snmppoll,
+              snmplastsnmppoll: ip.snmpinterface.snmplastsnmppoll,
+              lastIngressFlow: ip.snmpinterface.lastIngressFlow,
+              lastEgressFlow: ip.snmpinterface.lastEgressFlow,
+            }
+          : null,
+        isIpPrimary: ip.issnmpprimary,
+      })),
+      alarms: alarms
+        ? {
+            alarmId: alarms.alarmid,
+            severity: alarms.severity.toString(),
+            message: alarms.logmsg,
+            timeStamp: alarms.firsteventtime.toISOString(),
+          }
+        : null,
+    };
+  }
+
+  async getChartData(
+    filterOptions: ChartFilterOptions,
+    relations?: string[]
+  ): Promise<any> {
+    return await super.getChartData(filterOptions, ["NodeStatus"]);
+  }
+
+  async createNodeAgent(dto: AgentNodeCreateDto) {
+    dto["foreign-id"] = await this.nodeUtilsServicesManager.getForeignId();
+
+    // validation start
+
+    await this.nodeUtilsServicesManager.validateNodePayload(dto);
+
+    if (dto["category"]?.length > 0) {
+      // validating if categories exists
+      await this.nodeUtilsServicesManager.nodeCatogriesValid(dto["category"]);
+    }
+
+    // validation ends
+
+    const newEndpoint = this.getEndpoint(dto["requisition-name"]);
+    const requisitionName = dto["requisition-name"];
+    const geoLocation = dto["geolocation"];
+    delete dto["geolocation"];
+    delete dto["requisition-name"];
+    const user = dto["user"];
+    delete dto["user"];
+    const nodeDetails = dto["node_details"];
+    delete dto["node_details"];
+
+    const nodeJson = JSON.stringify(dto);
+
+    try {
+      await this.openNMSManager.makeRequest(newEndpoint, {
+        request: REQUEST_TYPES.POST,
+        body: nodeJson,
+      });
+
+      await this.openNMSManager.makeRequest(
+        `/requisitions/${requisitionName}/import`,
+        {
+          request: REQUEST_TYPES.PUT,
+          body: { rescanExisting: false },
+        }
+      );
+    } catch (error) {
+      throw new BadRequestException({ message: error.response.data });
+    }
+
+    dto["node_details"] = nodeDetails;
+    dto["requisition-name"] = requisitionName;
+    dto["geolocation"] = geoLocation;
+    dto["user"] = user;
+    dto["node_details"] = nodeDetails;
+    // @ts-ignore
+    dto["node_details"].dataSourceType = NodeDataSourceType.AGENT;
+    dto["node_details"].agent_port = dto["node_details"].agent_port || 9100;
+    const nodeObject = JSON.stringify(dto);
+
+    this.event.emit(`${this.entityName}-created`, nodeObject);
+    this.event.emit(NODE_EVENT_CONSTANTS.NODE_INITIALIZED, nodeObject);
+
+    const ipAddress =
+      await this.nodeUtilsServicesManager.extarctIpFromInterfaces(
+        dto["interface"]
+      );
+
+    if (ipAddress) {
+      const response = await this.nodeUtilsServicesManager.validateInstallation(
+        ipAddress,
+        dto["node_details"].agent_port
+      );
+
+      if (response.status !== AgentInstallationStatus.SUCCESS) {
+        this.event.emit(NODE_EVENT_CONSTANTS.AGENT_UNREACHABLE);
+      }
+    }
+    return dto;
+  }
+
+  async updateNodeAgent(dto: AgentNodeUpdateDto) {
+    // validation start
+
+    await this.nodeUtilsServicesManager.validateNodePayload(dto, true);
+
+    if (dto["category"]?.length > 0) {
+      // validating if categories exists
+      await this.nodeUtilsServicesManager.nodeCatogriesValid(dto["category"]);
+    }
+
+    // validation ends
+
+    const newEndpoint = this.getEndpoint(dto["requisition-name"]);
+    const requisitionName = dto["requisition-name"];
+    const geoLocation = dto["geolocation"];
+    delete dto["geolocation"];
+    delete dto["requisition-name"];
+    const user = dto["user"];
+    delete dto["user"];
+    const nodeDetails = dto["node_details"];
+    delete dto["node_details"];
+
+    const nodeJson = JSON.stringify(dto);
+
+    try {
+      const response = await this.openNMSManager.makeRequest(newEndpoint, {
+        request: REQUEST_TYPES.POST,
+        body: nodeJson,
+      });
+
+      await this.openNMSManager.makeRequest(
+        `/requisitions/${requisitionName}/import`,
+        {
+          request: REQUEST_TYPES.PUT,
+          body: { rescanExisting: false },
+        }
+      );
+    } catch (error) {
+      throw new BadRequestException({ message: error.response.data });
+    }
+
+    const nodeData = await this.repository.findOneBy({
+      foreignid: dto["foreign-id"],
+    });
+
+    dto["geolocation"] = geoLocation;
+
+    await this.nodeUtilsServicesManager.createGeolocation(
+      dto["node-label"],
+      dto["foreign-id"],
+      dto["requisition-name"],
+      dto["geolocation"]
+    );
+
+    if (dto["category"]?.length > 0) {
+      // removing the categories for a node
+      await this.nodeUtilsServicesManager.removeNodeCategory(nodeData.nodeid);
+
+      // ading the categories for a node
+      await this.nodeUtilsServicesManager.addNodeCategory(
+        dto["category"],
+        nodeData.nodeid
+      );
+    }
+
+    if (nodeDetails) {
+      const nodeDetailsData = await this.nodeDetailsRepository.findOneBy({
+        nodeNodeid: nodeData.nodeid,
+      });
+
+      await this.nodeDetailsRepository.save({
+        id: nodeDetailsData.id,
+        ...nodeDetails,
+      });
+    }
+
+    dto["node_details"] = nodeDetails;
+    dto["requisition-name"] = requisitionName;
+    dto["user"] = user;
+    dto["node_details"] = nodeDetails;
+    const nodeObject = JSON.stringify(dto);
+
+    this.event.emit(`${this.entityName}-updated`, nodeObject);
+    return dto;
+  }
+
+  async agentNodeInstallationValidate(payload: ValidateInstallationDto) {
+    const response = await this.nodeUtilsServicesManager.validateInstallation(
+      payload.ipAddress,
+      payload.port
+    );
+
+    return response;
+  }
+
+  async isIPUnique(ipAddr: string): Promise<boolean> {
+    const count = await this.ipInterfaceRepository.count({
+        where: { ipaddr: ipAddr }  
+    });
+
+    return count === 0;
+}
+
+
+  
+}
